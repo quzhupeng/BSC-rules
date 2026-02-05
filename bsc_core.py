@@ -340,9 +340,9 @@ class BSCProcessor:
 
         rule_text = rule_text.strip()
 
-        # 正向指标：每低/每差/每降/每少/每低于目标值
+        # 正向指标：每低/每差/每降/每少/每低于目标值/每起
         # 支持"扣"和"减"两种表达方式
-        # 格式如：每低1%扣2分、每低于1%扣2分、每低于目标值2%，减5分、每低3分减7分
+        # 格式如：每低1%扣2分、每低于1%扣2分、每低于目标值2%，减5分、每低3分减7分、每少0.1%扣5分、每起扣10分
         # 注意：alternation要按长度降序排列（长的在前）避免部分匹配问题
         patterns_positive = [
             # 格式1: 每低于目标值X%[,，]扣/减Y分
@@ -351,21 +351,35 @@ class BSCProcessor:
             r'每低于\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
             # 格式3: 每低X%[,，]扣/减Y分
             r'每低\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式4: 每低于目标值X分[,，]扣/减Y分
+            # 格式4: 每少X%[,，]扣/减Y分（如：每少0.1%扣5分）
+            r'每少\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式5: 每低于目标值X分[,，]扣/减Y分
             r'每低于目标值\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式5: 每低X分[,，]扣/减Y分
+            # 格式6: 每低X分[,，]扣/减Y分
             r'每低\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式6: 每少X个[,，]扣/减Y分
+            # 格式7: 每少X个[,，]扣/减Y分
             r'每少\s*([0-9]+\.?[0-9]*)\s*个\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式7: 每差/每降/每小 X单位[,，]扣/减Y分
+            # 格式8: 每起X扣/减Y分 或 每起扣/减Y分（逆向指标：如"每起扣10分"表示事故类指标）
+            # 这个格式需要特殊处理，因为默认是逆向指标（越少越好）
+            r'每起\s*(?:([0-9]+\.?[0-9]*)\s*(?:个|单位|起)?\s*)?(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式9: 每X起扣/减Y分（如：每1起扣10分，逆向指标）
+            r'每\s*([0-9]+\.?[0-9]*)\s*起\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式9: 每差/每降/每小 X单位[,，]扣/减Y分
             r'每[差小降](?:于目标值)?\s*([0-9]+\.?[0-9]*)\s*(?:%|[个人次项元万千百])?\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
         ]
 
         for pattern in patterns_positive:
             match = re.search(pattern, rule_text)
             if match:
-                x = float(match.group(1))
-                y = float(match.group(2))
+                x_str = match.group(1)
+                y_str = match.group(2)
+                # 处理x为空的情况（如"每起扣10分"，默认每起算1个单位）
+                if not x_str or x_str == '':
+                    x = 1.0
+                    y = float(y_str)
+                else:
+                    x = float(x_str)
+                    y = float(y_str)
                 # 检查匹配的文本中是否包含%
                 matched_text = match.group(0)
                 has_percent = '%' in matched_text
@@ -388,6 +402,47 @@ class BSCProcessor:
                 matched_text = match.group(0)
                 has_percent = '%' in matched_text
                 return (x, y, '逆向', has_percent)
+
+        return None
+
+    @staticmethod
+    def extract_accident_params(rule_text: str) -> Optional[Tuple[float, float, str]]:
+        """
+        提取"每起扣X分"类型的参数（逆向指标：事故类）
+
+        这类指标的逻辑是：从0开始（满分），每有1起事故扣X分
+        底线值（得60分）= 允许扣40分时的事故数 = 40 / X
+
+        Args:
+            rule_text: 规则文本
+
+        Returns:
+            (每起扣X分, 方向) 或 None
+        """
+        if pd.isna(rule_text) or not isinstance(rule_text, str):
+            return None
+
+        rule_text = rule_text.strip()
+
+        # 匹配"每起扣X分"或"每X起扣Y分"
+        patterns = [
+            r'每起\s*(?:([0-9]+\.?[0-9]*)\s*(?:个|单位|起)?\s*)?(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            r'每\s*([0-9]+\.?[0-9]*)\s*起\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, rule_text)
+            if match:
+                x_str = match.group(1)  # 每X起（可能为空）
+                y_str = match.group(2) if len(match.groups()) >= 2 else match.group(1)  # 扣Y分
+                # 如果x_str为空，说明是"每起扣Y分"，默认每1起扣Y分
+                if not x_str or x_str == '':
+                    y = float(y_str)
+                    x = 1.0
+                else:
+                    x = float(x_str)
+                    y = float(y_str)
+                return (x, y, '逆向')
 
         return None
 
@@ -427,7 +482,21 @@ class BSCProcessor:
         status = '成功'
         direction = self.detect_indicator_direction(rule_text) or '正向'
 
-        # 逻辑A（最高优先级）: 比例型规则
+        # 逻辑A（最高优先级）: 事故类指标（每起扣X分，逆向）
+        # 这类指标从0开始（满分），每有1起事故扣X分
+        # 底线值（得60分）= 允许扣40分时的事故数 = 40 / X
+        accident_params = self.extract_accident_params(rule_text)
+        if accident_params is not None:
+            x, y, accident_params_direction = accident_params
+            direction = accident_params_direction
+            # 从0开始，每X起扣Y分，得60分时可以有多少起？
+            # 40分 / Y分 = 允许扣的次数
+            # 每次扣X起，所以允许起数 = (40 / Y) × X
+            allowed_count = (40 / y) * x
+            baseline = allowed_count
+            return baseline, '成功', direction
+
+        # 逻辑B: 比例型规则
         ratio_info = self.extract_ratio_baseline(rule_text)
         if ratio_info is not None:
             ratio, detected_direction = ratio_info
@@ -435,7 +504,7 @@ class BSCProcessor:
             baseline = target * ratio
             return baseline, '成功', direction
 
-        # 逻辑B: 扣分推导
+        # 逻辑C: 扣分推导
         deduction = self.extract_deduction_params(rule_text)
         if deduction is not None:
             x, y, deduction_direction, rule_has_percent = deduction
