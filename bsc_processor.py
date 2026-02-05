@@ -171,9 +171,10 @@ class BSCProcessor:
     def normalize_target_value(value: Union[str, float, int]) -> Tuple[float, bool]:
         """
         归一化目标值
-        处理两种情况：
+        处理多种情况：
         1. 字符串 "85%" -> 0.85, is_percent=True
-        2. 数字 0.85 或 90 -> 对应浮点数, is_percent=False
+        2. 字符串 "85分" -> 85, is_percent=False
+        3. 数字 0.85 或 90 -> 对应浮点数, is_percent=False
 
         Args:
             value: 原始值
@@ -197,6 +198,9 @@ class BSCProcessor:
                     return float(num_str) / 100, True
                 except ValueError:
                     return 0.0, False
+
+            # 去除"分"字（如 "85分" -> 85）
+            value = value.replace('分', '').strip()
 
             # 尝试直接转换
             try:
