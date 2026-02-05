@@ -1,38 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-平衡计分卡KPI数据处理脚本
+平衡计分卡KPI数据处理核心类
 功能：将非结构化的KPI指标数据转化为标准化的平衡计分卡格式
 """
 
 import pandas as pd
 import re
 import openpyxl
-from pathlib import Path
 from typing import Tuple, Dict, Optional, Union
+from io import BytesIO
 
 
 class BSCProcessor:
-    """平衡计分卡数据处理器"""
+    """平衡计分卡数据处理器核心类"""
 
-    def __init__(self, input_file: str):
+    def __init__(self, input_file=None):
         """
         初始化处理器
 
         Args:
-            input_file: 输入Excel文件路径
+            input_file: 输入Excel文件路径或BytesIO对象
         """
         self.input_file = input_file
         self.df = None
         self.target_col = None
         self.rule_col = None
+        self.status_messages = []  # 用于存储处理状态信息
+
+    def _log(self, message: str):
+        """记录日志信息"""
+        self.status_messages.append(message)
 
     def load_data(self) -> pd.DataFrame:
         """读取Excel数据"""
         try:
             self.df = pd.read_excel(self.input_file)
-            print(f"成功读取文件，共 {len(self.df)} 行，{len(self.df.columns)} 列")
-            print(f"列名: {list(self.df.columns)}")
+            self._log(f"成功读取文件，共 {len(self.df)} 行，{len(self.df.columns)} 列")
+            self._log(f"列名: {list(self.df.columns)}")
             return self.df
         except Exception as e:
             raise Exception(f"读取文件失败: {e}")
@@ -127,9 +132,9 @@ class BSCProcessor:
 
         # 如果表头不在第0行，重新读取数据
         if header_row_idx and header_row_idx > 0:
-            print(f"识别到表头在第{header_row_idx + 1}行")
+            self._log(f"识别到表头在第{header_row_idx + 1}行")
             self.df = pd.read_excel(self.input_file, header=header_row_idx)
-            print(f"列名: {list(self.df.columns)}")
+            self._log(f"列名: {list(self.df.columns)}")
 
         # 识别目标值列（按优先级）
         self.target_col = None
@@ -139,7 +144,7 @@ class BSCProcessor:
                 # 匹配关键字，排除半年相关列
                 if keyword in col_str and not is_excluded(col_str):
                     self.target_col = col
-                    print(f"找到目标值列: {self.target_col} (匹配关键字: {keyword})")
+                    self._log(f"找到目标值列: {self.target_col} (匹配关键字: {keyword})")
                     break
             if self.target_col:
                 break
@@ -152,7 +157,7 @@ class BSCProcessor:
                 # 匹配关键字，排除半年相关列
                 if keyword in col_str and not is_excluded(col_str):
                     self.rule_col = col
-                    print(f"找到计分规则列: {self.rule_col} (匹配关键字: {keyword})")
+                    self._log(f"找到计分规则列: {self.rule_col} (匹配关键字: {keyword})")
                     break
             if self.rule_col:
                 break
@@ -162,8 +167,8 @@ class BSCProcessor:
         if not self.rule_col:
             raise Exception("无法识别计分规则列，请检查前3行是否有包含'计分规则'或'全年计分规则'的列")
 
-        print(f"最终使用 - 目标值列: {self.target_col}")
-        print(f"最终使用 - 计分规则列: {self.rule_col}")
+        self._log(f"最终使用 - 目标值列: {self.target_col}")
+        self._log(f"最终使用 - 计分规则列: {self.rule_col}")
 
         return self.target_col, self.rule_col
 
@@ -206,9 +211,6 @@ class BSCProcessor:
 
         # 如果是数字
         elif isinstance(value, (int, float)):
-            # 判断是否可能是百分比（0 < value < 1 且不是常见的整数）
-            # 但这里我们保守处理，认为直接读入的数字就是实际值
-            # 只有明确带%的才算百分比
             return float(value), False
 
         return 0.0, False
@@ -217,30 +219,15 @@ class BSCProcessor:
     def extract_explicit_baseline(rule_text: str) -> Optional[Tuple[float, str]]:
         """
         逻辑A：从规则文本中提取显式的底线值
-
-        模式匹配：
-        - "低于85%不得分"、"<85%不得分"、"<85%为0" -> 0.85, '正向'
-        - "高于85%不得分"、">85%得0分" -> 0.85, '逆向'
-        - "85分得60分"、"85为60分" -> 85, '正向'
-
-        注意：如果匹配"低于80分不得分"这种得分阈值，应返回None让后续逻辑处理
-
-        Args:
-            rule_text: 规则文本
-
-        Returns:
-            (底线值, 指标方向) 或 None
         """
         if pd.isna(rule_text) or not isinstance(rule_text, str):
             return None
 
         rule_text = rule_text.strip()
 
-        # 先检查是否包含得分阈值描述（如"低于80分不得分"），这种情况下返回None
-        # 因为这些值是得分阈值，不是指标底线值
+        # 先检查是否包含得分阈值描述
         score_threshold_pattern = r'(?:低于|不足|少于)\s*([0-9]+)\s*分\s*(?:不得分|为0|得0分)'
         if re.search(score_threshold_pattern, rule_text):
-            # 检查是否同时包含比例型关键词，如果是则让比例逻辑处理
             ratio_keywords = [
                 r'实际\s*[:：]?\s*目标',
                 r'达成\s*/\s*目标',
@@ -250,9 +237,9 @@ class BSCProcessor:
                 r'最多\s*100分',
             ]
             if any(re.search(kw, rule_text) for kw in ratio_keywords):
-                return None  # 让比例规则处理
+                return None
 
-        # 模式1: 低于/小于XX%不得分/得0分 (正向指标) - 必须带%才认为是指标值
+        # 模式1: 低于/小于XX%不得分/得0分 (正向指标)
         patterns_positive = [
             r'(?:低于|小于)\s*([0-9]+\.?[0-9]*)%\s*(?:不得分|得0分)',
             r'<\s*([0-9]+\.?[0-9]*)%\s*(?:不得分|得0分)',
@@ -268,7 +255,7 @@ class BSCProcessor:
                     return value / 100, '正向'
                 return value, '正向'
 
-        # 模式2: 高于/大于/超过XX%不得分/得0分 (逆向指标) - 必须带%才认为是指标值
+        # 模式2: 高于/大于/超过XX%不得分/得0分 (逆向指标)
         patterns_negative = [
             r'(?:高于|大于|超过)\s*([0-9]+\.?[0-9]*)%\s*(?:不得分|得0分)',
             r'>\s*([0-9]+\.?[0-9]*)%\s*(?:不得分|得0分)',
@@ -303,25 +290,13 @@ class BSCProcessor:
 
     @staticmethod
     def extract_ratio_baseline(rule_text: str) -> Optional[Tuple[float, str]]:
-        """
-        提取比例型计分规则的得分阈值
-
-        比例型规则：得分 = (实际值 ÷ 目标值) × 100
-        - "实际达成率/目标值*100，低于60分不得分" -> 得分阈值60, 底线系数0.6
-        - "最多100分，低于60分不得分" -> 得分阈值60, 底线系数0.6
-
-        Args:
-            rule_text: 规则文本
-
-        Returns:
-            (得分阈值, 方向) 或 None
-        """
+        """提取比例型计分规则的得分阈值"""
         if pd.isna(rule_text) or not isinstance(rule_text, str):
             return None
 
         rule_text = rule_text.strip()
 
-        # 检查是否是比例型规则（包含除法或公式形式）
+        # 检查是否是比例型规则
         ratio_keywords = [
             r'实际\s*[:：]?\s*目标',
             r'达成\s*/\s*目标',
@@ -331,15 +306,12 @@ class BSCProcessor:
         ]
 
         is_ratio_rule = any(re.search(kw, rule_text) for kw in ratio_keywords)
-
-        # 或者规则是"最多100分"这种形式（隐含比例计算）
         is_max_score = re.search(r'最多\s*100分', rule_text) is not None
 
         if not is_ratio_rule and not is_max_score:
             return None
 
         # 提取得分阈值
-        # 模式：低于60分不得分、60分以下不得分、低于60为0、不足60分不得分等
         score_threshold_patterns = [
             r'低于\s*([0-9]+)\s*分[,，]?\s*(?:不得分|为0|得0分)',
             r'(?:不足|少于)\s*([0-9]+)\s*分[,，]?\s*(?:不得分|为0|得0分)',
@@ -351,30 +323,14 @@ class BSCProcessor:
             match = re.search(pattern, rule_text)
             if match:
                 threshold = float(match.group(1))
-                # 如果阈值是60，返回比例系数0.6
-                # 其他阈值按比例计算
                 ratio = threshold / 100
                 return (ratio, '正向')
 
-        # 默认使用60分
         return (0.6, '正向')
 
     @staticmethod
     def extract_deduction_params(rule_text: str) -> Optional[Tuple[float, float, str, bool]]:
-        """
-        从规则文本中提取扣分参数
-
-        匹配模式：
-        - "每低1%扣2分" -> (1, 2, '正向', True)
-        - "每高1%扣2分" -> (1, 2, '逆向', True)
-        - "每低于目标值0.1%扣5分" -> (0.1, 5, '正向', True)
-
-        Args:
-            rule_text: 规则文本
-
-        Returns:
-            (每X单位, 扣Y分, 方向, 规则中的X是否带%) 或 None
-        """
+        """从规则文本中提取扣分参数"""
         if pd.isna(rule_text) or not isinstance(rule_text, str):
             return None
 
@@ -391,7 +347,6 @@ class BSCProcessor:
             if match:
                 x = float(match.group(1))
                 y = float(match.group(2))
-                # 检查匹配的文本中是否包含%
                 has_percent = '%' in match.group(0)
                 return (x, y, '正向', has_percent)
 
@@ -405,8 +360,7 @@ class BSCProcessor:
             match = re.search(pattern, rule_text)
             if match:
                 x = float(match.group(1))
-                y = float(match.group(2))  # 扣分数是group(2)因为单位组是非捕获的
-                # 检查匹配的文本中是否包含%
+                y = float(match.group(2))
                 has_percent = '%' in match.group(0)
                 return (x, y, '逆向', has_percent)
 
@@ -414,24 +368,11 @@ class BSCProcessor:
 
     @staticmethod
     def detect_indicator_direction(rule_text: str) -> Optional[str]:
-        """
-        从规则文本中检测指标方向（正向/逆向）
-
-        正向指标：越高越好（如完成率、达成率、收入）
-        逆向指标：越低越好（如投诉率、差错率、成本）
-
-        Args:
-            rule_text: 规则文本
-
-        Returns:
-            '正向'/'逆向'/None
-        """
+        """从规则文本中检测指标方向（正向/逆向）"""
         if pd.isna(rule_text) or not isinstance(rule_text, str):
             return None
 
-        rule_text_lower = rule_text.lower()
-
-        # 逆向指标关键词（优先检测，权重更高）
+        # 逆向指标关键词
         negative_keywords = [
             '投诉率', '差错率', '故障率', '缺陷率', '不良率', '报废率',
             '成本控制', '控制在', '不超过', '不高于', '每高', '每超',
@@ -456,30 +397,12 @@ class BSCProcessor:
 
     def calculate_baseline(self, target: float, rule_text: str,
                           is_percent: bool) -> Tuple[float, str, str]:
-        """
-        计算底线值（核心函数）
-
-        逻辑优先级：
-        A. 比例型规则：实际值/目标值×100，得分阈值60分
-        B. 扣分推导：根据扣分规则计算
-        C. 显式阈值：从规则中直接提取（排除得分阈值如"60分"）
-        D. 默认兜底：目标值的80%或120%
-
-        Args:
-            target: 目标值（已归一化为浮点数）
-            rule_text: 规则文本
-            is_percent: 原始数据是否为百分比格式
-
-        Returns:
-            (底线值, 解析状态, 指标方向)
-        """
+        """计算底线值（核心函数）"""
         baseline = None
         status = '成功'
         direction = self.detect_indicator_direction(rule_text) or '正向'
 
         # 逻辑A（最高优先级）: 比例型规则
-        # 得分 = (实际值 ÷ 目标值) × 100
-        # 当得分=60时：底线值 = 目标值 × 0.6
         ratio_info = self.extract_ratio_baseline(rule_text)
         if ratio_info is not None:
             ratio, detected_direction = ratio_info
@@ -493,10 +416,8 @@ class BSCProcessor:
             x, y, deduction_direction, rule_has_percent = deduction
             direction = deduction_direction
 
-            # 假设满分100，底线60分，允许扣40分
             allowed_gap = (40 / y) * x
 
-            # 处理百分比单位转换
             if rule_has_percent:
                 allowed_gap = allowed_gap / 100
 
@@ -507,27 +428,20 @@ class BSCProcessor:
 
             return baseline, '成功', direction
 
-        # 逻辑B: 显式阈值（排除得分阈值如"60分"、"不得分"）
+        # 逻辑C: 显式阈值
         explicit_baseline = self.extract_explicit_baseline(rule_text)
         if explicit_baseline is not None:
             baseline, detected_direction = explicit_baseline
-            # 检查是否是得分阈值（如60分这种常见的得分底线）
-            # 如果提取的值是60且规则中包含"不得分/得0分"，可能是得分阈值而非指标值
-            is_score_threshold = (
-                abs(baseline - 60) < 0.01 and  # 值接近60
-                '不得分' in rule_text          # 包含"不得分"
-            )
-            # 如果是得分阈值且有扣分规则，则不应使用显式阈值
-            # 但因为已经检查过扣分规则，这里能执行说明没有扣分规则
-            # 所以只有当baseline看起来像指标值时才使用
-            if not is_score_threshold:
+            if not (
+                abs(baseline - 60) < 0.01 and '不得分' in rule_text
+            ):
                 if detected_direction:
                     direction = detected_direction
                 return baseline, '成功', direction
 
             return baseline, '成功', direction
 
-        # 逻辑C: 默认兜底
+        # 逻辑D: 默认兜底
         if direction == '逆向':
             baseline = target * 1.2
         else:
@@ -538,21 +452,10 @@ class BSCProcessor:
 
     @staticmethod
     def format_value(value: float, is_percent: bool) -> str:
-        """
-        将数值格式化为显示字符串
-
-        Args:
-            value: 数值
-            is_percent: 是否为百分比格式
-
-        Returns:
-            格式化后的字符串
-        """
+        """将数值格式化为显示字符串"""
         if is_percent:
-            # 转换为百分比显示
             return f"{value * 100:.2f}%"
         else:
-            # 根据数值大小决定小数位数
             if value == int(value):
                 return str(int(value))
             elif abs(value) >= 1000:
@@ -564,23 +467,11 @@ class BSCProcessor:
 
     def generate_standard_rule(self, target: float, baseline: float,
                                direction: str, is_percent: bool) -> str:
-        """
-        生成规范化计分规则文案
-
-        Args:
-            target: 目标值
-            baseline: 底线值
-            direction: 指标方向 ('正向'/'逆向')
-            is_percent: 是否为百分比格式
-
-        Returns:
-            规范化文案
-        """
+        """生成规范化计分规则文案"""
         target_str = self.format_value(target, is_percent)
         baseline_str = self.format_value(baseline, is_percent)
 
         if direction == '逆向':
-            # 逆向指标
             template = (
                 f"P为指标实际值，{target_str}为目标值，{baseline_str}为底线值。\n"
                 f"1.若P≤{target_str}，得100分（满分）；\n"
@@ -590,7 +481,6 @@ class BSCProcessor:
                 f"4.若P＞{baseline_str}，得0分。"
             )
         else:
-            # 正向指标
             template = (
                 f"P为指标实际值，{target_str}为目标值，{baseline_str}为底线值。\n"
                 f"1.若P≥{target_str}，得100分（满分）；\n"
@@ -603,40 +493,25 @@ class BSCProcessor:
         return template
 
     def process_row(self, row: pd.Series) -> Dict:
-        """
-        处理单行数据
-
-        Args:
-            row: 数据行
-
-        Returns:
-            包含处理结果的字典
-        """
+        """处理单行数据"""
         target_raw = row[self.target_col]
         rule_text = row[self.rule_col] if self.rule_col in row else ""
 
-        # 归一化目标值
         target, is_percent = self.normalize_target_value(target_raw)
-
-        # 计算底线值
         baseline, status, direction = self.calculate_baseline(
             target, str(rule_text), is_percent
         )
 
-        # 根据底线值和目标值的关系，验证/调整方向（仅在Manual Check或未明确检测到方向时）
-        # 对于显式提取的方向（状态为Success），保持原方向不变
         if status == '人工校验':
             if baseline < target:
                 direction = '正向'
             elif baseline > target:
                 direction = '逆向'
 
-        # 生成规范化文案
         standard_rule = self.generate_standard_rule(
             target, baseline, direction, is_percent
         )
 
-        # 格式化底线值用于显示
         baseline_display = self.format_value(baseline, is_percent)
 
         return {
@@ -649,18 +524,27 @@ class BSCProcessor:
             '是否百分比': is_percent
         }
 
-    def process(self) -> pd.DataFrame:
+    def process(self, progress_callback=None) -> pd.DataFrame:
         """
         执行完整处理流程
+
+        Args:
+            progress_callback: 进度回调函数，参数为当前进度(0-100)
 
         Returns:
             处理后的DataFrame
         """
+        self.status_messages.clear()
+
         # 加载数据
         self.load_data()
+        if progress_callback:
+            progress_callback(20)
 
         # 识别列
         self.identify_columns()
+        if progress_callback:
+            progress_callback(40)
 
         # 过滤掉半年指标行
         original_rows = len(self.df)
@@ -681,10 +565,10 @@ class BSCProcessor:
             filtered_df = self.df[mask].copy()
             filtered_rows = original_rows - len(filtered_df)
             if filtered_rows > 0:
-                print(f"已过滤掉 {filtered_rows} 行半年指标数据")
+                self._log(f"已过滤掉 {filtered_rows} 行半年指标数据")
             self.df = filtered_df
         else:
-            print("警告：未找到可用于过滤的列，跳过半年指标过滤")
+            self._log("警告：未找到可用于过滤的列，跳过半年指标过滤")
 
         # 添加新列
         results = {
@@ -694,7 +578,7 @@ class BSCProcessor:
             '指标方向': []
         }
 
-        # 处理每一行
+        total_rows = len(self.df)
         for idx, row in self.df.iterrows():
             try:
                 result = self.process_row(row)
@@ -703,12 +587,16 @@ class BSCProcessor:
                 results['解析状态'].append(result['解析状态'])
                 results['指标方向'].append(result['指标方向'])
             except Exception as e:
-                # 异常处理：使用默认值
-                print(f"警告: 第{idx+2}行处理失败: {e}")
+                self._log(f"警告: 第{idx+2}行处理失败: {e}")
                 results['推导底线值'].append('ERROR')
                 results['规范版计分规则'].append(f'解析失败: {str(e)}')
                 results['解析状态'].append(f'ERROR: {str(e)[:50]}')
                 results['指标方向'].append('unknown')
+
+            # 更新进度
+            if progress_callback:
+                progress = 40 + int((idx + 1) / total_rows * 50)
+                progress_callback(progress)
 
         # 将结果添加到原DataFrame
         for col, values in results.items():
@@ -716,29 +604,34 @@ class BSCProcessor:
 
         # 统计
         status_counts = self.df['解析状态'].value_counts()
-        print(f"\n处理完成！统计信息：")
-        print(status_counts)
+        self._log("处理完成！统计信息：")
+        for status, count in status_counts.items():
+            self._log(f"  {status}: {count} 行")
 
         manual_check = (self.df['解析状态'] == '人工校验').sum()
-        print(f"需要人工核对的行数: {manual_check}")
+        self._log(f"需要人工核对的行数: {manual_check}")
+
+        if progress_callback:
+            progress_callback(100)
 
         return self.df
 
-    def save(self, output_file: str = 'processed_scorecard.xlsx'):
+    def save_to_bytesio(self) -> BytesIO:
         """
-        保存处理结果
+        将处理结果保存到BytesIO对象（用于Streamlit下载）
 
-        Args:
-            output_file: 输出文件名
+        Returns:
+            BytesIO对象
         """
         if self.df is None:
             raise Exception("请先执行process()方法")
 
+        output = BytesIO()
+
         # 设置列宽
-        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
             self.df.to_excel(writer, index=False)
 
-            # 获取workbook和worksheet
             workbook = writer.book
             worksheet = writer.sheets['Sheet1']
 
@@ -752,7 +645,6 @@ class BSCProcessor:
 
             for col, width in column_widths.items():
                 if col in self.df.columns:
-                    # 找到列的字母索引
                     col_idx = list(self.df.columns).index(col) + 1
                     col_letter = openpyxl.utils.get_column_letter(col_idx)
                     worksheet.column_dimensions[col_letter].width = width
@@ -764,47 +656,22 @@ class BSCProcessor:
                 for cell in worksheet[col_letter]:
                     cell.alignment = openpyxl.styles.Alignment(wrap_text=True)
 
-        print(f"\n结果已保存到: {output_file}")
-        return output_file
+        output.seek(0)
+        return output
 
+    def get_stats(self) -> Dict:
+        """获取处理统计信息"""
+        if self.df is None or '解析状态' not in self.df.columns:
+            return {}
 
-def main():
-    """主函数"""
-    import sys
+        status_counts = self.df['解析状态'].value_counts()
+        return {
+            'total': len(self.df),
+            'success': int(status_counts.get('成功', 0)),
+            'manual_check': int(status_counts.get('人工校验', 0)),
+            'error': int(sum(cnt for status, cnt in status_counts.items() if 'ERROR' in status)),
+        }
 
-    # 获取输入文件
-    if len(sys.argv) > 1:
-        input_file = sys.argv[1]
-    else:
-        # 查找当前目录下的Excel文件
-        current_dir = Path(__file__).parent
-        excel_files = list(current_dir.glob('*.xlsx')) + list(current_dir.glob('*.xls'))
-        if not excel_files:
-            print("当前目录下没有找到Excel文件，请指定输入文件路径")
-            print("用法: python bsc_processor.py <input_file>")
-            return
-
-        # 选择第一个Excel文件
-        input_file = str(excel_files[0])
-        print(f"自动选择输入文件: {input_file}")
-
-    try:
-        # 创建处理器
-        processor = BSCProcessor(input_file)
-
-        # 执行处理
-        processor.process()
-
-        # 保存结果
-        processor.save()
-
-        print("\n处理完成！")
-
-    except Exception as e:
-        print(f"\n错误: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-if __name__ == '__main__':
-    main()
+    def get_logs(self) -> list:
+        """获取处理日志"""
+        return self.status_messages
