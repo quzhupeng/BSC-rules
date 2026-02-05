@@ -45,11 +45,11 @@ class BSCProcessor:
         Returns:
             (目标值列名, 计分规则列名)
         """
-        # 目标值关键字
-        target_keywords = ['目标值', '年度目标值', '26年度目标值', '2026目标值',
+        # 目标值关键字（按优先级排序，年度优先于半年度）
+        target_keywords = ['年度目标值', '2026目标值', '26年度目标值', '目标值',
                           '考核目标值', 'kpi目标值', '指标值', '目标']
-        # 计分规则关键字
-        rule_keywords = ['计分规则', '评分规则', '考核规则', '计分标准']
+        # 计分规则关键字（按优先级排序，年度优先于半年度）
+        rule_keywords = ['计分规则', '年度计分规则', '评分规则', '考核规则', '计分标准']
 
         # 检查表头在哪一行（最多检查前3行）
         header_row_idx = None
@@ -58,7 +58,9 @@ class BSCProcessor:
         # 首先检查当前列名（第0行，作为表头）
         for keyword in target_keywords:
             for col in self.df.columns:
-                if keyword in str(col):
+                col_str = str(col)
+                # 匹配关键字，但排除"半年度"列（优先使用年度）
+                if keyword in col_str and '半年度' not in col_str:
                     if header_row_idx is None:
                         header_row_idx = 0
                     break
@@ -67,7 +69,9 @@ class BSCProcessor:
 
         for keyword in rule_keywords:
             for col in self.df.columns:
-                if keyword in str(col):
+                col_str = str(col)
+                # 匹配关键字，但排除"半年度"列（优先使用年度）
+                if keyword in col_str and '半年度' not in col_str:
                     if header_row_idx is None:
                         header_row_idx = 0
                     break
@@ -108,7 +112,9 @@ class BSCProcessor:
         self.target_col = None
         for keyword in target_keywords:
             for col in self.df.columns:
-                if keyword in str(col):
+                col_str = str(col)
+                # 匹配关键字，但优先使用年度列，排除半年度
+                if keyword in col_str and '半年度' not in col_str:
                     self.target_col = col
                     break
             if self.target_col:
@@ -118,7 +124,9 @@ class BSCProcessor:
         self.rule_col = None
         for keyword in rule_keywords:
             for col in self.df.columns:
-                if keyword in str(col):
+                col_str = str(col)
+                # 匹配关键字，但优先使用年度列，排除半年度
+                if keyword in col_str and '半年度' not in col_str:
                     self.rule_col = col
                     break
             if self.rule_col:
@@ -186,9 +194,11 @@ class BSCProcessor:
         逻辑A：从规则文本中提取显式的底线值
 
         模式匹配：
-        - "低于85不得分"、"<85不得分"、"<85为0" -> 85, '正向'
-        - "高于85不得分"、">85得0分" -> 85, '逆向'
+        - "低于85%不得分"、"<85%不得分"、"<85%为0" -> 0.85, '正向'
+        - "高于85%不得分"、">85%得0分" -> 0.85, '逆向'
         - "85分得60分"、"85为60分" -> 85, '正向'
+
+        注意：如果匹配"低于80分不得分"这种得分阈值，应返回None让后续逻辑处理
 
         Args:
             rule_text: 规则文本
@@ -201,12 +211,28 @@ class BSCProcessor:
 
         rule_text = rule_text.strip()
 
-        # 模式1: 低于/小于XX不得分/得0分 (正向指标)
+        # 先检查是否包含得分阈值描述（如"低于80分不得分"），这种情况下返回None
+        # 因为这些值是得分阈值，不是指标底线值
+        score_threshold_pattern = r'(?:低于|不足|少于)\s*([0-9]+)\s*分\s*(?:不得分|为0|得0分)'
+        if re.search(score_threshold_pattern, rule_text):
+            # 检查是否同时包含比例型关键词，如果是则让比例逻辑处理
+            ratio_keywords = [
+                r'实际\s*[:：]?\s*目标',
+                r'达成\s*/\s*目标',
+                r'除\s*以\s*目标',
+                r'/\s*目标',
+                r'÷\s*目标',
+                r'最多\s*100分',
+            ]
+            if any(re.search(kw, rule_text) for kw in ratio_keywords):
+                return None  # 让比例规则处理
+
+        # 模式1: 低于/小于XX%不得分/得0分 (正向指标) - 必须带%才认为是指标值
         patterns_positive = [
-            r'(?:低于|小于)\s*([0-9]+\.?[0-9]*)%?\s*(?:不得分|得0分)',
-            r'<\s*([0-9]+\.?[0-9]*)%?\s*(?:不得分|得0分)',
-            r'(?:低于|小于)\s*([0-9]+\.?[0-9]*)%?\s*分?\s*(?:不得分|得0分)',
-            r'<\s*([0-9]+\.?[0-9]*)%?\s*分?\s*(?:不得分|得0分)',
+            r'(?:低于|小于)\s*([0-9]+\.?[0-9]*)%\s*(?:不得分|得0分)',
+            r'<\s*([0-9]+\.?[0-9]*)%\s*(?:不得分|得0分)',
+            r'(?:低于|小于)\s*([0-9]+\.?[0-9]*)%\s*分?\s*(?:不得分|得0分)',
+            r'<\s*([0-9]+\.?[0-9]*)%\s*分?\s*(?:不得分|得0分)',
         ]
 
         for pattern in patterns_positive:
@@ -217,12 +243,12 @@ class BSCProcessor:
                     return value / 100, '正向'
                 return value, '正向'
 
-        # 模式2: 高于/大于/超过XX不得分/得0分 (逆向指标)
+        # 模式2: 高于/大于/超过XX%不得分/得0分 (逆向指标) - 必须带%才认为是指标值
         patterns_negative = [
-            r'(?:高于|大于|超过)\s*([0-9]+\.?[0-9]*)%?\s*(?:不得分|得0分)',
-            r'>\s*([0-9]+\.?[0-9]*)%?\s*(?:不得分|得0分)',
-            r'(?:高于|大于|超过)\s*([0-9]+\.?[0-9]*)%?\s*分?\s*(?:不得分|得0分)',
-            r'>\s*([0-9]+\.?[0-9]*)%?\s*分?\s*(?:不得分|得0分)',
+            r'(?:高于|大于|超过)\s*([0-9]+\.?[0-9]*)%\s*(?:不得分|得0分)',
+            r'>\s*([0-9]+\.?[0-9]*)%\s*(?:不得分|得0分)',
+            r'(?:高于|大于|超过)\s*([0-9]+\.?[0-9]*)%\s*分?\s*(?:不得分|得0分)',
+            r'>\s*([0-9]+\.?[0-9]*)%\s*分?\s*(?:不得分|得0分)',
         ]
 
         for pattern in patterns_negative:
@@ -287,13 +313,13 @@ class BSCProcessor:
         if not is_ratio_rule and not is_max_score:
             return None
 
-        # 提取得分阈值（通常是60分）
-        # 模式：低于60分不得分、60分以下不得分、低于60为0等
+        # 提取得分阈值
+        # 模式：低于60分不得分、60分以下不得分、低于60为0、不足60分不得分等
         score_threshold_patterns = [
-            r'低于\s*([0-9]+)\s*分\s*不得分',
-            r'低于\s*([0-9]+)\s*分\s*为\s*0',
-            r'([0-9]+)分\s*以下\s*不得分',
-            r'少于\s*([0-9]+)\s*分\s*不得分',
+            r'低于\s*([0-9]+)\s*分[,，]?\s*(?:不得分|为0|得0分)',
+            r'(?:不足|少于)\s*([0-9]+)\s*分[,，]?\s*(?:不得分|为0|得0分)',
+            r'([0-9]+)分\s*(?:以下|为0)\s*(?:不得分|得0分)',
+            r'满\s*100分.*?(?:低于|不足)\s*([0-9]+)\s*分[,，]?\s*不得分',
         ]
 
         for pattern in score_threshold_patterns:
@@ -354,8 +380,9 @@ class BSCProcessor:
             match = re.search(pattern, rule_text)
             if match:
                 x = float(match.group(1))
-                has_percent = match.group(2) is not None
-                y = float(match.group(3))
+                y = float(match.group(2))  # 扣分数是group(2)因为单位组是非捕获的
+                # 检查匹配的文本中是否包含%
+                has_percent = '%' in match.group(0)
                 return (x, y, '逆向', has_percent)
 
         return None
