@@ -179,7 +179,10 @@ class BSCProcessor:
         处理多种情况：
         1. 字符串 "85%" -> 0.85, is_percent=True
         2. 字符串 "85分" -> 85, is_percent=False
-        3. 数字 0.85 或 90 -> 对应浮点数, is_percent=False
+        3. 字符串 "10个" / "5人" / "3万" 等 -> 去除单位后转换为数字
+        4. 数字 0.85 或 90 -> 对应浮点数, is_percent=False
+
+        支持的单位：分、个、人、份、例、种、场、万、千、次、项、元、起、件、台、套、吨、株、亩、公斤、千克、立方米、平米、平方米、㎡、m²、m³
 
         Args:
             value: 原始值
@@ -204,8 +207,23 @@ class BSCProcessor:
                 except ValueError:
                     return 0.0, False
 
-            # 去除"分"字（如 "85分" -> 85）
-            value = value.replace('分', '').strip()
+            # 需要去除的单位列表（百分号已在前面处理）
+            units_to_remove = [
+                '分', '个', '人', '份', '例', '种', '场',
+                '万', '千', '次', '项', '元', '起', '件',
+                '台', '套', '吨', '株', '亩', '公斤', '千克',
+                '立方米', '平米', '平方米', '㎡', 'm²', 'm³',
+                '小时', '天', '日', '周', '月', '年',
+                '公里', '千米', '米', 'm', 'km',
+                '升', 'ml', 'l', 'g', 'kg',
+                '小时', '分钟', '秒',
+            ]
+
+            # 去除所有单位（优先匹配长单位，避免部分匹配）
+            for unit in sorted(units_to_remove, key=len, reverse=True):
+                if value.endswith(unit):
+                    value = value[:-len(unit)].strip()
+                    break
 
             # 尝试直接转换
             try:
