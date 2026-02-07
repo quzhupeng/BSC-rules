@@ -796,3 +796,321 @@ class BSCProcessor:
     def get_logs(self) -> list:
         """获取处理日志"""
         return self.status_messages
+
+
+class BSCMultiSheetProcessor:
+    """
+    多Sheet平衡计分卡数据处理器
+    用于处理包含多个sheet的Excel文件，每个sheet可能包含KPI数据
+    """
+
+    def __init__(self, input_file):
+        """
+        初始化多Sheet处理器
+
+        Args:
+            input_file: 输入Excel文件路径或BytesIO对象
+        """
+        self.input_file = input_file
+        self.results = {}  # {sheet_name: processed_df}
+        self.stats = {}  # {sheet_name: stats}
+        self.all_logs = []  # 所有日志
+        self.success_sheets = []  # 成功处理的sheet名称
+        self.failed_sheets = []  # 失败的sheet名称
+        self.skipped_sheets = []  # 跳过的sheet名称（无有效列）
+
+    def _log(self, message: str):
+        """记录日志信息"""
+        self.all_logs.append(message)
+
+    def get_sheet_names(self) -> list:
+        """获取Excel文件中所有sheet名称"""
+        try:
+            xl_file = pd.ExcelFile(self.input_file)
+            return xl_file.sheet_names
+        except Exception as e:
+            self._log(f"读取sheet列表失败: {e}")
+            return []
+
+    def _check_sheet_has_valid_columns(self, sheet_name: str) -> bool:
+        """
+        检查sheet是否包含有效的目标值列和计分规则列
+
+        Args:
+            sheet_name: sheet名称
+
+        Returns:
+            是否包含有效列
+        """
+        try:
+            df = pd.read_excel(self.input_file, sheet_name=sheet_name, header=None)
+            df_str = df.astype(str)
+
+            # 检查是否包含目标值关键字
+            target_keywords = ['目标值', '年度目标值', '全年目标值', '2026目标值']
+            has_target = False
+            for kw in target_keywords:
+                if df_str.apply(lambda row: row.str.contains(kw, na=False).any(), axis=1).any():
+                    has_target = True
+                    break
+
+            # 检查是否包含计分规则关键字
+            rule_keywords = ['计分规则', '评分规则', '考核规则', '计分标准']
+            has_rule = False
+            for kw in rule_keywords:
+                if df_str.apply(lambda row: row.str.contains(kw, na=False).any(), axis=1).any():
+                    has_rule = True
+                    break
+
+            return has_target and has_rule
+        except Exception:
+            return False
+
+    def process(self, progress_callback=None) -> Dict:
+        """
+        处理所有sheet
+
+        Args:
+            progress_callback: 进度回调函数，参数为当前进度(0-100)
+
+        Returns:
+            处理结果统计字典
+        """
+        sheet_names = self.get_sheet_names()
+        if not sheet_names:
+            raise Exception("无法读取Excel文件的sheet列表")
+
+        total_sheets = len(sheet_names)
+        self._log(f"发现 {total_sheets} 个sheet: {', '.join(sheet_names)}")
+
+        for idx, sheet_name in enumerate(sheet_names):
+            if progress_callback:
+                progress = int((idx / total_sheets) * 100)
+                progress_callback(progress)
+
+            self._log(f"\n正在处理 sheet: {sheet_name}")
+
+            # 检查sheet是否包含有效列
+            if not self._check_sheet_has_valid_columns(sheet_name):
+                self._log(f"  ⚠️ Sheet '{sheet_name}' 不包含目标值或计分规则列，跳过")
+                self.skipped_sheets.append(sheet_name)
+                continue
+
+            try:
+                # 创建单sheet处理器
+                processor = BSCProcessor(self.input_file)
+
+                # 读取指定sheet的数据
+                processor.df = pd.read_excel(self.input_file, sheet_name=sheet_name)
+
+                # 识别列
+                try:
+                    processor.identify_columns()
+                except Exception as e:
+                    self._log(f"  ❌ Sheet '{sheet_name}' 列识别失败: {e}")
+                    self.failed_sheets.append(sheet_name)
+                    continue
+
+                # 处理数据
+                try:
+                    result_df = processor._process_df(processor.df, processor.target_col, processor.rule_col)
+                    self.results[sheet_name] = result_df
+                    self.stats[sheet_name] = processor.get_stats()
+                    self.success_sheets.append(sheet_name)
+
+                    # 添加处理日志
+                    for log in processor.get_logs():
+                        self._log(f"  {log}")
+
+                    status_counts = result_df['解析状态'].value_counts()
+                    success_count = int(status_counts.get('成功', 0))
+                    manual_count = int(status_counts.get('人工校验', 0))
+                    error_count = int(sum(cnt for status, cnt in status_counts.items() if 'ERROR' in status))
+
+                    self._log(f"  ✅ Sheet '{sheet_name}' 处理成功: {len(result_df)}行 "
+                             f"(成功:{success_count}, 人工校验:{manual_count}, 错误:{error_count})")
+
+                except Exception as e:
+                    self._log(f"  ❌ Sheet '{sheet_name}' 数据处理失败: {e}")
+                    self.failed_sheets.append(sheet_name)
+
+            except Exception as e:
+                self._log(f"  ❌ Sheet '{sheet_name}' 处理异常: {e}")
+                self.failed_sheets.append(sheet_name)
+
+        if progress_callback:
+            progress_callback(100)
+
+        # 生成汇总日志
+        self._log("\n" + "=" * 70)
+        self._log("多Sheet处理汇总:")
+        self._log(f"  总sheet数: {total_sheets}")
+        self._log(f"  ✅ 成功处理: {len(self.success_sheets)} 个")
+        if self.success_sheets:
+            self._log(f"     {', '.join(self.success_sheets)}")
+        self._log(f"  ⚠️ 跳过（无有效列）: {len(self.skipped_sheets)} 个")
+        if self.skipped_sheets:
+            self._log(f"     {', '.join(self.skipped_sheets)}")
+        self._log(f"  ❌ 处理失败: {len(self.failed_sheets)} 个")
+        if self.failed_sheets:
+            self._log(f"     {', '.join(self.failed_sheets)}")
+        self._log("=" * 70)
+
+        return {
+            'total': total_sheets,
+            'success': len(self.success_sheets),
+            'skipped': len(self.skipped_sheets),
+            'failed': len(self.failed_sheets),
+            'sheet_names': sheet_names,
+            'success_sheets': self.success_sheets,
+            'skipped_sheets': self.skipped_sheets,
+            'failed_sheets': self.failed_sheets,
+        }
+
+    def save_to_bytesio(self) -> BytesIO:
+        """
+        将所有成功处理的sheet保存到一个Excel文件
+
+        Returns:
+            BytesIO对象
+        """
+        if not self.results:
+            raise Exception("没有成功处理的sheet数据")
+
+        output = BytesIO()
+
+        # 设置列宽
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            for sheet_name, df in self.results.items():
+                # Excel sheet名称不能超过31个字符，且不能包含特殊字符
+                safe_sheet_name = sheet_name[:31]
+                # 替换不允许的字符
+                for char in ['\\', '/', '*', '[', ']', ':', '?']:
+                    safe_sheet_name = safe_sheet_name.replace(char, '_')
+
+                df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+
+                # 设置列宽
+                worksheet = writer.sheets[safe_sheet_name]
+                column_widths = {
+                    '推导底线值': 15,
+                    '规范版计分规则': 60,
+                    '解析状态': 20,
+                    '指标方向': 12
+                }
+
+                for col, width in column_widths.items():
+                    if col in df.columns:
+                        col_idx = list(df.columns).index(col) + 1
+                        col_letter = openpyxl.utils.get_column_letter(col_idx)
+                        worksheet.column_dimensions[col_letter].width = width
+
+                # 设置规范版计分规则列为自动换行
+                if '规范版计分规则' in df.columns:
+                    col_idx = list(df.columns).index('规范版计分规则') + 1
+                    col_letter = openpyxl.utils.get_column_letter(col_idx)
+                    for cell in worksheet[col_letter]:
+                        cell.alignment = openpyxl.styles.Alignment(wrap_text=True)
+
+        output.seek(0)
+        return output
+
+    def get_stats(self) -> Dict:
+        """
+        获取所有sheet的处理统计
+
+        Returns:
+            统计字典
+        """
+        return {
+            'summary': {
+                'total': len(self.success_sheets) + len(self.failed_sheets) + len(self.skipped_sheets),
+                'success': len(self.success_sheets),
+                'skipped': len(self.skipped_sheets),
+                'failed': len(self.failed_sheets),
+            },
+            'by_sheet': self.stats,
+            'success_sheets': self.success_sheets,
+            'failed_sheets': self.failed_sheets,
+            'skipped_sheets': self.skipped_sheets,
+        }
+
+    def get_logs(self) -> list:
+        """获取所有处理日志"""
+        return self.all_logs
+
+
+# 为BSCProcessor添加内部处理方法（用于多sheet处理）
+def _process_df(self, df: pd.DataFrame, target_col: str, rule_col: str) -> pd.DataFrame:
+    """
+    处理已加载数据框的内部方法
+    """
+    self.df = df
+    self.target_col = target_col
+    self.rule_col = rule_col
+
+    # 过滤掉半年指标行
+    original_rows = len(self.df)
+    exclude_keywords = ['半年度', '半年', '半期', '中期']
+
+    # 检查是否有"维度"或"评价指标"列用于判断
+    filter_col = None
+    for col in self.df.columns:
+        if '维度' in str(col) or '评价指标' in str(col) or '指标名称' in str(col):
+            filter_col = col
+            break
+
+    if filter_col:
+        # 过滤包含半年关键词的行
+        mask = self.df[filter_col].astype(str).apply(
+            lambda x: not any(kw in x for kw in exclude_keywords)
+        )
+        filtered_df = self.df[mask].copy()
+        filtered_rows = original_rows - len(filtered_df)
+        if filtered_rows > 0:
+            self._log(f"已过滤掉 {filtered_rows} 行半年指标数据")
+        self.df = filtered_df
+    else:
+        self._log("警告：未找到可用于过滤的列，跳过半年指标过滤")
+
+    # 添加新列
+    results = {
+        '推导底线值': [],
+        '规范版计分规则': [],
+        '解析状态': [],
+        '指标方向': []
+    }
+
+    total_rows = len(self.df)
+    for idx, row in self.df.iterrows():
+        try:
+            result = self.process_row(row)
+            results['推导底线值'].append(result['推导底线值'])
+            results['规范版计分规则'].append(result['规范版计分规则'])
+            results['解析状态'].append(result['解析状态'])
+            results['指标方向'].append(result['指标方向'])
+        except Exception as e:
+            self._log(f"警告: 第{idx+2}行处理失败: {e}")
+            results['推导底线值'].append('ERROR')
+            results['规范版计分规则'].append(f'解析失败: {str(e)}')
+            results['解析状态'].append(f'ERROR: {str(e)[:50]}')
+            results['指标方向'].append('unknown')
+
+    # 将结果添加到原DataFrame
+    for col, values in results.items():
+        self.df[col] = values
+
+    # 统计
+    status_counts = self.df['解析状态'].value_counts()
+    self._log("处理完成！统计信息：")
+    for status, count in status_counts.items():
+        self._log(f"  {status}: {count} 行")
+
+    manual_check = (self.df['解析状态'] == '人工校验').sum()
+    self._log(f"需要人工核对的行数: {manual_check}")
+
+    return self.df
+
+
+# 动态添加方法到BSCProcessor类
+BSCProcessor._process_df = _process_df
