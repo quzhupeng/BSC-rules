@@ -28,6 +28,7 @@ class BSCProcessor:
         self.rule_col = None
         self.semi_target_col = None  # 半年度目标值列
         self.semi_rule_col = None    # 半年度计分规则列
+        self._sheet_name = None  # 当前处理的sheet名（多sheet模式下使用）
         self.status_messages = []  # 用于存储处理状态信息
 
     def _log(self, message: str):
@@ -100,7 +101,7 @@ class BSCProcessor:
                 break
 
         # 如果第一行列名没找到所有关键字，检查数据行
-        if header_row_idx is None or True:
+        if header_row_idx is None:
             found_target_in_col = any(
                 any(kw in str(col) and not is_excluded(str(col)) for kw in target_keywords)
                 for col in self.df.columns
@@ -135,7 +136,10 @@ class BSCProcessor:
         # 如果表头不在第0行，重新读取数据
         if header_row_idx and header_row_idx > 0:
             self._log(f"识别到表头在第{header_row_idx + 1}行")
-            self.df = pd.read_excel(self.input_file, header=header_row_idx)
+            read_kwargs = {'header': header_row_idx}
+            if self._sheet_name:
+                read_kwargs['sheet_name'] = self._sheet_name
+            self.df = pd.read_excel(self.input_file, **read_kwargs)
             self._log(f"列名: {list(self.df.columns)}")
 
         # 识别目标值列（按优先级）
@@ -975,6 +979,7 @@ class BSCMultiSheetProcessor:
             try:
                 # 创建单sheet处理器
                 processor = BSCProcessor(self.input_file)
+                processor._sheet_name = sheet_name
 
                 # 读取指定sheet的数据
                 processor.df = pd.read_excel(self.input_file, sheet_name=sheet_name)

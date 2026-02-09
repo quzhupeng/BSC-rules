@@ -347,6 +347,21 @@ if st.session_state.processed_df is not None:
                            f"跳过 {file_summary.get('skipped', 0)} 个, "
                            f"失败 {file_summary.get('failed', 0)} 个")
 
+            # 当前选中sheet的半年度统计
+            current_df = st.session_state.processed_df
+            if current_df is not None and '半年度_解析状态' in current_df.columns:
+                semi_counts = current_df['半年度_解析状态'].value_counts()
+                st.markdown("#### 半年度处理统计")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("✅ 成功解析", int(semi_counts.get('成功', 0)))
+                with col2:
+                    st.metric("⚠️ 需人工校验", int(semi_counts.get('人工校验', 0)))
+                with col3:
+                    st.metric("无半年度数据", int(semi_counts.get('无半年度数据', 0)))
+                with col4:
+                    st.metric("❌ 错误", int(sum(cnt for status, cnt in semi_counts.items() if 'ERROR' in status)))
+
     # 多Sheet处理汇总
     elif st.session_state.is_multi_sheet and st.session_state.multi_sheet_stats:
         summary = st.session_state.multi_sheet_stats
@@ -398,6 +413,48 @@ if st.session_state.processed_df is not None:
                     st.metric("人工校验", sheet_stats.get('manual_check', 0))
                 with col4:
                     st.metric("错误", sheet_stats.get('error', 0))
+
+                # 半年度统计
+                if 'semi_annual' in sheet_stats:
+                    semi = sheet_stats['semi_annual']
+                    st.markdown("#### 半年度处理统计")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("✅ 成功解析", semi['success'])
+                    with col2:
+                        st.metric("⚠️ 需人工校验", semi['manual_check'])
+                    with col3:
+                        st.metric("无半年度数据", semi['no_data'])
+                    with col4:
+                        st.metric("❌ 错误", semi['error'])
+        elif multi_processor and len(multi_processor.success_sheets) == 1:
+            # 只有一个成功sheet，直接显示其统计
+            only_sheet = multi_processor.success_sheets[0]
+            if only_sheet in multi_processor.stats:
+                sheet_stats = multi_processor.stats[only_sheet]
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric(f"{only_sheet} - 总行数", sheet_stats.get('total', 0))
+                with col2:
+                    st.metric("成功解析", sheet_stats.get('success', 0))
+                with col3:
+                    st.metric("人工校验", sheet_stats.get('manual_check', 0))
+                with col4:
+                    st.metric("错误", sheet_stats.get('error', 0))
+
+                # 半年度统计
+                if 'semi_annual' in sheet_stats:
+                    semi = sheet_stats['semi_annual']
+                    st.markdown("#### 半年度处理统计")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("✅ 成功解析", semi['success'])
+                    with col2:
+                        st.metric("⚠️ 需人工校验", semi['manual_check'])
+                    with col3:
+                        st.metric("无半年度数据", semi['no_data'])
+                    with col4:
+                        st.metric("❌ 错误", semi['error'])
     else:
         # 单Sheet统计信息
         stats = st.session_state.stats
