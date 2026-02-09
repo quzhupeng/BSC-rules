@@ -1217,3 +1217,172 @@ def _process_df(self, df: pd.DataFrame, target_col: str, rule_col: str,
 
 # 动态添加方法到BSCProcessor类
 BSCProcessor._process_df = _process_df
+
+
+class BSCBatchProcessor:
+    """批量处理多个Excel文件"""
+
+    def __init__(self):
+        self.file_results = {}      # {文件名: {sheet名: df}}
+        self.file_stats = {}        # {文件名: summary_dict}
+        self.all_logs = []
+        self.success_files = []
+        self.failed_files = []
+
+    def _log(self, message: str):
+        """记录日志信息"""
+        self.all_logs.append(message)
+
+    def process(self, files, progress_callback=None) -> dict:
+        """
+        批量处理多个Excel文件
+
+        Args:
+            files: list of (filename, BytesIO) 元组
+            progress_callback: 进度回调函数，参数为当前进度(0-100)
+
+        Returns:
+            汇总dict: {total, success, failed, success_files, failed_files}
+        """
+        total_files = len(files)
+        self._log(f"开始批量处理 {total_files} 个文件")
+
+        for file_idx, (filename, file_bytes) in enumerate(files):
+            if progress_callback:
+                progress = int((file_idx / total_files) * 100)
+                progress_callback(progress)
+
+            self._log(f"\n{'='*70}")
+            self._log(f"正在处理文件 [{file_idx+1}/{total_files}]: {filename}")
+            self._log(f"{'='*70}")
+
+            try:
+                file_bytes.name = filename
+                multi_processor = BSCMultiSheetProcessor(file_bytes)
+                summary = multi_processor.process()
+
+                # 收集日志
+                for log in multi_processor.get_logs():
+                    self._log(f"  {log}")
+
+                if summary['success'] > 0:
+                    self.file_results[filename] = multi_processor.results
+                    self.file_stats[filename] = summary
+                    self.success_files.append(filename)
+                    self._log(f"✅ 文件 '{filename}' 处理成功: "
+                             f"{summary['success']}个Sheet成功, "
+                             f"{summary['skipped']}个跳过, "
+                             f"{summary['failed']}个失败")
+                else:
+                    self.failed_files.append(filename)
+                    self._log(f"❌ 文件 '{filename}' 无可处理的Sheet")
+
+            except Exception as e:
+                self.failed_files.append(filename)
+                self._log(f"❌ 文件 '{filename}' 处理失败: {e}")
+
+        if progress_callback:
+            progress_callback(100)
+
+        # 生成汇总日志
+        self._log(f"\n{'='*70}")
+        self._log("批量处理汇总:")
+        self._log(f"  总文件数: {total_files}")
+        self._log(f"  ✅ 成功: {len(self.success_files)} 个")
+        if self.success_files:
+            self._log(f"     {', '.join(self.success_files)}")
+        self._log(f"  ❌ 失败: {len(self.failed_files)} 个")
+        if self.failed_files:
+            self._log(f"     {', '.join(self.failed_files)}")
+        self._log(f"{'='*70}")
+
+        return {
+            'total': total_files,
+            'success': len(self.success_files),
+            'failed': len(self.failed_files),
+            'success_files': self.success_files,
+            'failed_files': self.failed_files,
+        }
+
+    def save_to_bytesio(self) -> BytesIO:
+        """
+        将所有成功处理的文件结果合并保存到一个Excel文件
+
+        Sheet命名规则：{文件名去后缀}_{原Sheet名}
+        - 截断到31字符（Excel限制）
+        - 替换 \\ / * [ ] : ? 为 _
+        - 冲突时加 _2, _3 后缀
+
+        Returns:
+            BytesIO对象
+        """
+        if not self.file_results:
+            raise Exception("没有成功处理的文件数据")
+
+        output = BytesIO()
+        used_names = {}  # 用于检测Sheet名冲突
+
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            for filename, sheets in self.file_results.items():
+                # 去除文件后缀
+                file_base = filename
+                for ext in ['.xlsx', '.xls', '.XLSX', '.XLS']:
+                    if file_base.endswith(ext):
+                        file_base = file_base[:-len(ext)]
+                        break
+
+                for sheet_name, df in sheets.items():
+                    # 构造Sheet名
+                    raw_name = f"{file_base}_{sheet_name}"
+
+                    # 替换不允许的字符
+                    safe_name = raw_name
+                    for char in ['\\', '/', '*', '[', ']', ':', '?']:
+                        safe_name = safe_name.replace(char, '_')
+
+                    # 截断到31字符
+                    safe_name = safe_name[:31]
+
+                    # 冲突处理
+                    if safe_name in used_names:
+                        used_names[safe_name] += 1
+                        suffix = f"_{used_names[safe_name]}"
+                        safe_name = safe_name[:31 - len(suffix)] + suffix
+                    else:
+                        used_names[safe_name] = 1
+
+                    df.to_excel(writer, sheet_name=safe_name, index=False)
+
+                    # 设置列宽和格式
+                    worksheet = writer.sheets[safe_name]
+                    column_widths = {
+                        '推导底线值': 15,
+                        '规范版计分规则': 60,
+                        '解析状态': 20,
+                        '指标方向': 12,
+                        '半年度_推导底线值': 15,
+                        '半年度_规范版计分规则': 60,
+                        '半年度_解析状态': 20,
+                        '半年度_指标方向': 12
+                    }
+
+                    for col, width in column_widths.items():
+                        if col in df.columns:
+                            col_idx = list(df.columns).index(col) + 1
+                            col_letter = openpyxl.utils.get_column_letter(col_idx)
+                            worksheet.column_dimensions[col_letter].width = width
+
+                    # 设置规范版计分规则列为自动换行
+                    for wrap_col in ['规范版计分规则', '半年度_规范版计分规则']:
+                        if wrap_col in df.columns:
+                            col_idx = list(df.columns).index(wrap_col) + 1
+                            col_letter = openpyxl.utils.get_column_letter(col_idx)
+                            for cell in worksheet[col_letter]:
+                                cell.alignment = openpyxl.styles.Alignment(wrap_text=True)
+
+        output.seek(0)
+        return output
+
+    def get_logs(self) -> list:
+        """获取所有处理日志"""
+        return self.all_logs

@@ -12,7 +12,7 @@ from datetime import datetime
 import openpyxl
 
 # 导入核心处理类
-from bsc_core import BSCProcessor, BSCMultiSheetProcessor
+from bsc_core import BSCProcessor, BSCMultiSheetProcessor, BSCBatchProcessor
 
 # 页面配置
 st.set_page_config(
@@ -80,8 +80,8 @@ with st.sidebar:
     - **多Sheet同步处理**
 
     **使用方法：**
-    1. 上传包含KPI数据的Excel文件
-    2. 选择处理模式（单Sheet/多Sheet）
+    1. 选择处理模式（单Sheet/多Sheet/批量文件）
+    2. 上传Excel文件（批量模式支持多个文件）
     3. 等待自动处理完成
     4. 预览处理结果
     5. 下载处理后的文件
@@ -102,6 +102,7 @@ with st.sidebar:
     st.markdown("""
     - **单Sheet处理**：只处理第一个有数据的Sheet
     - **多Sheet处理**：自动检测并处理所有包含KPI数据的Sheet，每个Sheet输出为结果文件中的一个Sheet
+    - **批量文件处理**：一次上传多个Excel文件，自动处理所有Sheet，结果合并到一个Excel输出
     """)
 
 # 初始化session state
@@ -119,30 +120,99 @@ if 'multi_sheet_stats' not in st.session_state:
     st.session_state.multi_sheet_stats = None
 if 'is_multi_sheet' not in st.session_state:
     st.session_state.is_multi_sheet = False
+if 'batch_processor' not in st.session_state:
+    st.session_state.batch_processor = None
+if 'batch_stats' not in st.session_state:
+    st.session_state.batch_stats = None
+if 'is_batch' not in st.session_state:
+    st.session_state.is_batch = False
 
 # 文件上传区域
 st.markdown("### 📁 文件上传")
-uploaded_file = st.file_uploader(
-    "请上传Excel文件 (.xlsx)",
-    type=['xlsx', 'xls'],
-    label_visibility="collapsed",
-    help="上传包含目标值和计分规则列的Excel文件"
-)
 
-# 处理按钮
-if uploaded_file is not None:
+# 处理模式选择（放在文件上传之前，因为 accept_multiple_files 在渲染时确定）
+with st.columns([1, 1])[0]:
+    processing_mode = st.radio(
+        "处理模式",
+        ["单Sheet处理", "多Sheet处理", "批量文件处理"],
+        horizontal=True,
+        help="单Sheet: 只处理第一个有数据的Sheet | 多Sheet: 处理所有包含KPI数据的Sheet | 批量文件: 一次上传多个文件合并处理"
+    )
+
+# 根据模式渲染不同的 uploader
+if processing_mode == "批量文件处理":
+    uploaded_files = st.file_uploader(
+        "请上传多个Excel文件 (.xlsx)",
+        type=['xlsx', 'xls'],
+        label_visibility="collapsed",
+        accept_multiple_files=True,
+        key="batch_uploader",
+        help="上传多个包含目标值和计分规则列的Excel文件"
+    )
+    uploaded_file = None  # 批量模式不使用单文件变量
+else:
+    uploaded_file = st.file_uploader(
+        "请上传Excel文件 (.xlsx)",
+        type=['xlsx', 'xls'],
+        label_visibility="collapsed",
+        key="single_uploader",
+        help="上传包含目标值和计分规则列的Excel文件"
+    )
+    uploaded_files = None  # 非批量模式不使用多文件变量
+
+# 处理按钮 — 批量文件处理模式
+if processing_mode == "批量文件处理" and uploaded_files:
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        st.markdown(f"**已选择 {len(uploaded_files)} 个文件：** " +
+                    ", ".join([f"`{f.name}`" for f in uploaded_files]))
+    with col2:
+        if st.button("🚀 开始批量处理", type="primary", use_container_width=True):
+            with st.spinner("正在批量处理数据，请稍候..."):
+                try:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    def progress_callback(progress):
+                        progress_bar.progress(progress)
+                        status_text.text(f"正在处理... {progress}%")
+
+                    batch_proc = BSCBatchProcessor()
+                    files = [(f.name, BytesIO(f.getvalue())) for f in uploaded_files]
+                    summary = batch_proc.process(files, progress_callback)
+
+                    # 保存到 session state
+                    st.session_state.batch_processor = batch_proc
+                    st.session_state.batch_stats = summary
+                    st.session_state.is_batch = True
+                    st.session_state.is_multi_sheet = False
+                    st.session_state.logs = batch_proc.get_logs()
+
+                    # 取第一个成功文件的第一个sheet用于预览
+                    if batch_proc.success_files:
+                        first_file = batch_proc.success_files[0]
+                        first_sheet = list(batch_proc.file_results[first_file].keys())[0]
+                        st.session_state.processed_df = batch_proc.file_results[first_file][first_sheet]
+                    else:
+                        st.session_state.processed_df = None
+
+                    progress_bar.progress(100)
+                    status_text.text("✅ 批量处理完成！")
+
+                    if summary['success'] > 0:
+                        st.success(f"批量处理完成！成功: {summary['success']}个文件, 失败: {summary['failed']}个文件")
+                    else:
+                        st.warning(f"所有文件处理失败。失败: {summary['failed']}个文件")
+
+                except Exception as e:
+                    st.error(f"批量处理失败：{str(e)}")
+                    st.exception(e)
+
+# 处理按钮 — 单文件处理模式（单Sheet / 多Sheet）
+elif uploaded_file is not None:
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         st.markdown(f"**已选择文件：** `{uploaded_file.name}`")
-
-    # 处理模式选择
-    with st.columns([1, 1])[0]:
-        processing_mode = st.radio(
-            "处理模式",
-            ["单Sheet处理", "多Sheet处理"],
-            horizontal=True,
-            help="单Sheet: 只处理第一个有数据的Sheet | 多Sheet: 处理所有包含KPI数据的Sheet"
-        )
 
     with col2:
         if st.button("🚀 开始处理", type="primary", use_container_width=True):
@@ -170,6 +240,7 @@ if uploaded_file is not None:
                     if processing_mode == "多Sheet处理":
                         # 多Sheet处理模式
                         st.session_state.is_multi_sheet = True
+                        st.session_state.is_batch = False
                         multi_processor = BSCMultiSheetProcessor(file_bytes)
 
                         # 执行处理
@@ -199,6 +270,7 @@ if uploaded_file is not None:
                     else:
                         # 单Sheet处理模式
                         st.session_state.is_multi_sheet = False
+                        st.session_state.is_batch = False
                         processor = BSCProcessor(file_bytes)
 
                         # 执行处理
@@ -224,8 +296,59 @@ if st.session_state.processed_df is not None:
     st.markdown("---")
     st.markdown("### 📈 处理结果")
 
+    # 批量文件处理汇总
+    if st.session_state.is_batch and st.session_state.batch_stats:
+        summary = st.session_state.batch_stats
+        batch_proc = st.session_state.batch_processor
+
+        st.markdown("#### 📊 批量文件处理汇总")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("总文件数", summary['total'])
+        with col2:
+            st.metric("✅ 成功处理", summary['success'], delta_color="normal")
+        with col3:
+            if summary['failed'] > 0:
+                st.metric("❌ 失败", summary['failed'])
+            else:
+                st.metric("失败", summary['failed'])
+
+        # 显示文件列表
+        if summary['success_files']:
+            st.markdown("**✅ 成功处理的文件:** " + ", ".join(summary['success_files']))
+        if summary['failed_files']:
+            st.markdown("**❌ 处理失败的文件:** " + ", ".join(summary['failed_files']))
+
+        st.markdown("---")
+
+        # 两级选择器：先选文件 → 再选Sheet
+        if batch_proc and batch_proc.success_files:
+            sel_col1, sel_col2 = st.columns(2)
+            with sel_col1:
+                selected_file = st.selectbox(
+                    "选择要预览的文件",
+                    batch_proc.success_files,
+                    key="batch_file_selector"
+                )
+            with sel_col2:
+                available_sheets = list(batch_proc.file_results[selected_file].keys())
+                selected_sheet = st.selectbox(
+                    "选择要预览的Sheet",
+                    available_sheets,
+                    key="batch_sheet_selector"
+                )
+
+            st.session_state.processed_df = batch_proc.file_results[selected_file][selected_sheet]
+
+            # 显示该文件的统计信息
+            if selected_file in batch_proc.file_stats:
+                file_summary = batch_proc.file_stats[selected_file]
+                st.markdown(f"**{selected_file}**: 成功 {file_summary.get('success', 0)} 个Sheet, "
+                           f"跳过 {file_summary.get('skipped', 0)} 个, "
+                           f"失败 {file_summary.get('failed', 0)} 个")
+
     # 多Sheet处理汇总
-    if st.session_state.is_multi_sheet and st.session_state.multi_sheet_stats:
+    elif st.session_state.is_multi_sheet and st.session_state.multi_sheet_stats:
         summary = st.session_state.multi_sheet_stats
 
         # 显示多Sheet处理汇总
@@ -358,7 +481,9 @@ if st.session_state.processed_df is not None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"BSC处理结果_{timestamp}.xlsx"
 
-        if st.session_state.is_multi_sheet and st.session_state.multi_sheet_processor:
+        if st.session_state.is_batch and st.session_state.batch_processor:
+            excel_data = st.session_state.batch_processor.save_to_bytesio()
+        elif st.session_state.is_multi_sheet and st.session_state.multi_sheet_processor:
             excel_data = st.session_state.multi_sheet_processor.save_to_bytesio()
         else:
             excel_data = st.session_state.processor.save_to_bytesio()
@@ -396,7 +521,7 @@ st.markdown(
 )
 
 # 空状态提示
-if uploaded_file is None and st.session_state.processed_df is None:
+if uploaded_file is None and not uploaded_files and st.session_state.processed_df is None:
     st.markdown("---")
     st.markdown("""
     ### 👋 欢迎使用平衡计分卡KPI数据处理器
