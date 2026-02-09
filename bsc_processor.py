@@ -26,6 +26,8 @@ class BSCProcessor:
         self.df = None
         self.target_col = None
         self.rule_col = None
+        self.semi_target_col = None  # 半年度目标值列
+        self.semi_rule_col = None    # 半年度计分规则列
 
     def load_data(self) -> pd.DataFrame:
         """读取Excel数据"""
@@ -167,6 +169,41 @@ class BSCProcessor:
 
         return self.target_col, self.rule_col
 
+    def identify_semi_annual_columns(self):
+        """
+        识别半年度目标值列和计分规则列（可选功能）
+        找不到时不报错，设为None
+        """
+        semi_target_keywords = ['半年度目标值', '半年目标值', '中期目标值', '半期目标值']
+        semi_rule_keywords = ['半年度计分规则', '半年计分规则', '中期计分规则', '半期计分规则']
+
+        # 识别半年度目标值列
+        self.semi_target_col = None
+        for keyword in semi_target_keywords:
+            for col in self.df.columns:
+                if keyword in str(col):
+                    self.semi_target_col = col
+                    print(f"找到半年度目标值列: {self.semi_target_col} (匹配关键字: {keyword})")
+                    break
+            if self.semi_target_col:
+                break
+
+        # 识别半年度计分规则列
+        self.semi_rule_col = None
+        for keyword in semi_rule_keywords:
+            for col in self.df.columns:
+                if keyword in str(col):
+                    self.semi_rule_col = col
+                    print(f"找到半年度计分规则列: {self.semi_rule_col} (匹配关键字: {keyword})")
+                    break
+            if self.semi_rule_col:
+                break
+
+        if not self.semi_target_col:
+            print("未找到半年度目标值列，跳过半年度处理")
+        if not self.semi_rule_col:
+            print("未找到半年度计分规则列，跳过半年度处理")
+
     @staticmethod
     def normalize_target_value(value: Union[str, float, int]) -> Tuple[float, bool]:
         """
@@ -204,6 +241,7 @@ class BSCProcessor:
 
             # 需要去除的单位列表（百分号已在前面处理）
             units_to_remove = [
+                '万元', '千元', '百元', '亿元',
                 '分', '个', '人', '份', '例', '种', '场',
                 '万', '千', '次', '项', '元', '起', '件',
                 '台', '套', '吨', '株', '亩', '公斤', '千克',
@@ -211,7 +249,7 @@ class BSCProcessor:
                 '小时', '天', '日', '周', '月', '年',
                 '公里', '千米', '米', 'm', 'km',
                 '升', 'ml', 'l', 'g', 'kg',
-                '小时', '分钟', '秒',
+                '分钟', '秒',
             ]
 
             # 去除所有单位（优先匹配长单位，避免部分匹配）
@@ -644,18 +682,22 @@ class BSCProcessor:
 
         return template
 
-    def process_row(self, row: pd.Series) -> Dict:
+    def process_row(self, row: pd.Series, target_col=None, rule_col=None) -> Dict:
         """
         处理单行数据
 
         Args:
             row: 数据行
+            target_col: 可选，指定目标值列名
+            rule_col: 可选，指定计分规则列名
 
         Returns:
             包含处理结果的字典
         """
-        target_raw = row[self.target_col]
-        rule_text = row[self.rule_col] if self.rule_col in row else ""
+        tc = target_col if target_col is not None else self.target_col
+        rc = rule_col if rule_col is not None else self.rule_col
+        target_raw = row[tc]
+        rule_text = row[rc] if rc in row else ""
 
         # 归一化目标值
         target, is_percent = self.normalize_target_value(target_raw)
@@ -703,30 +745,7 @@ class BSCProcessor:
 
         # 识别列
         self.identify_columns()
-
-        # 过滤掉半年指标行
-        original_rows = len(self.df)
-        exclude_keywords = ['半年度', '半年', '半期', '中期']
-
-        # 检查是否有"维度"或"评价指标"列用于判断
-        filter_col = None
-        for col in self.df.columns:
-            if '维度' in str(col) or '评价指标' in str(col) or '指标名称' in str(col):
-                filter_col = col
-                break
-
-        if filter_col:
-            # 过滤包含半年关键词的行
-            mask = self.df[filter_col].astype(str).apply(
-                lambda x: not any(kw in x for kw in exclude_keywords)
-            )
-            filtered_df = self.df[mask].copy()
-            filtered_rows = original_rows - len(filtered_df)
-            if filtered_rows > 0:
-                print(f"已过滤掉 {filtered_rows} 行半年指标数据")
-            self.df = filtered_df
-        else:
-            print("警告：未找到可用于过滤的列，跳过半年指标过滤")
+        self.identify_semi_annual_columns()
 
         # 添加新列
         results = {
@@ -755,6 +774,45 @@ class BSCProcessor:
         # 将结果添加到原DataFrame
         for col, values in results.items():
             self.df[col] = values
+
+        # 半年度处理
+        if self.semi_target_col and self.semi_rule_col:
+            print("开始半年度数据处理...")
+            semi_results = {
+                '半年度_推导底线值': [],
+                '半年度_规范版计分规则': [],
+                '半年度_解析状态': [],
+                '半年度_指标方向': []
+            }
+
+            for idx, row in self.df.iterrows():
+                semi_target_raw = row[self.semi_target_col]
+                if pd.isna(semi_target_raw) or str(semi_target_raw).strip() == '':
+                    semi_results['半年度_推导底线值'].append('')
+                    semi_results['半年度_规范版计分规则'].append('')
+                    semi_results['半年度_解析状态'].append('无半年度数据')
+                    semi_results['半年度_指标方向'].append('')
+                    continue
+
+                try:
+                    result = self.process_row(row, target_col=self.semi_target_col, rule_col=self.semi_rule_col)
+                    semi_results['半年度_推导底线值'].append(result['推导底线值'])
+                    semi_results['半年度_规范版计分规则'].append(result['规范版计分规则'])
+                    semi_results['半年度_解析状态'].append(result['解析状态'])
+                    semi_results['半年度_指标方向'].append(result['指标方向'])
+                except Exception as e:
+                    print(f"警告: 第{idx+2}行半年度处理失败: {e}")
+                    semi_results['半年度_推导底线值'].append('ERROR')
+                    semi_results['半年度_规范版计分规则'].append(f'解析失败: {str(e)}')
+                    semi_results['半年度_解析状态'].append(f'ERROR: {str(e)[:50]}')
+                    semi_results['半年度_指标方向'].append('unknown')
+
+            for col, values in semi_results.items():
+                self.df[col] = values
+
+            semi_status_counts = self.df['半年度_解析状态'].value_counts()
+            print(f"\n半年度处理完成！统计信息：")
+            print(semi_status_counts)
 
         # 统计
         status_counts = self.df['解析状态'].value_counts()
@@ -789,7 +847,11 @@ class BSCProcessor:
                 '推导底线值': 15,
                 '规范版计分规则': 60,
                 '解析状态': 20,
-                '指标方向': 12
+                '指标方向': 12,
+                '半年度_推导底线值': 15,
+                '半年度_规范版计分规则': 60,
+                '半年度_解析状态': 20,
+                '半年度_指标方向': 12
             }
 
             for col, width in column_widths.items():
@@ -800,11 +862,12 @@ class BSCProcessor:
                     worksheet.column_dimensions[col_letter].width = width
 
             # 设置规范版计分规则列为自动换行
-            if '规范版计分规则' in self.df.columns:
-                col_idx = list(self.df.columns).index('规范版计分规则') + 1
-                col_letter = openpyxl.utils.get_column_letter(col_idx)
-                for cell in worksheet[col_letter]:
-                    cell.alignment = openpyxl.styles.Alignment(wrap_text=True)
+            for wrap_col in ['规范版计分规则', '半年度_规范版计分规则']:
+                if wrap_col in self.df.columns:
+                    col_idx = list(self.df.columns).index(wrap_col) + 1
+                    col_letter = openpyxl.utils.get_column_letter(col_idx)
+                    for cell in worksheet[col_letter]:
+                        cell.alignment = openpyxl.styles.Alignment(wrap_text=True)
 
         print(f"\n结果已保存到: {output_file}")
         return output_file

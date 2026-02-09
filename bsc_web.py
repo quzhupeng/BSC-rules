@@ -76,7 +76,8 @@ with st.sidebar:
     - 底线值智能推导
     - 指标方向判定
     - 规范化计分规则生成
-    - **多Sheet同步处理**（新功能）
+    - **半年度数据同步处理**（自动识别半年度列）
+    - **多Sheet同步处理**
 
     **使用方法：**
     1. 上传包含KPI数据的Excel文件
@@ -291,6 +292,20 @@ if st.session_state.processed_df is not None:
                 else:
                     st.metric("错误", stats['error'])
 
+            # 半年度统计
+            if 'semi_annual' in stats:
+                semi = stats['semi_annual']
+                st.markdown("#### 半年度处理统计")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("✅ 成功解析", semi['success'])
+                with col2:
+                    st.metric("⚠️ 需人工校验", semi['manual_check'])
+                with col3:
+                    st.metric("无半年度数据", semi['no_data'])
+                with col4:
+                    st.metric("❌ 错误", semi['error'])
+
     # 处理日志
     if st.session_state.logs:
         with st.expander("📋 查看处理日志"):
@@ -307,10 +322,12 @@ if st.session_state.processed_df is not None:
 
     # 高亮人工校验行的样式函数
     def highlight_manual_check(row):
-        if row.get('解析状态') == '人工校验':
-            return ['background-color: #fff3cd'] * len(row)
-        elif row.get('解析状态', '').startswith('ERROR'):
+        annual_status = row.get('解析状态', '')
+        semi_status = row.get('半年度_解析状态', '')
+        if str(annual_status).startswith('ERROR') or str(semi_status).startswith('ERROR'):
             return ['background-color: #f8d7da'] * len(row)
+        elif annual_status == '人工校验' or semi_status == '人工校验':
+            return ['background-color: #fff3cd'] * len(row)
         return [''] * len(row)
 
     # 应用样式
