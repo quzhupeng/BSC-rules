@@ -169,12 +169,20 @@ class BSCProcessor:
 
         return self.target_col, self.rule_col
 
+    @staticmethod
+    def normalize_fullwidth(text: str) -> str:
+        """将全角标点转为半角，便于正则统一匹配"""
+        replacements = {'＜': '<', '＞': '>', '＝': '=', '（': '(', '）': ')', '％': '%', '＊': '*'}
+        for fw, hw in replacements.items():
+            text = text.replace(fw, hw)
+        return text
+
     def identify_semi_annual_columns(self):
         """
         识别半年度目标值列和计分规则列（可选功能）
         找不到时不报错，设为None
         """
-        semi_target_keywords = ['半年度目标值', '半年目标值', '中期目标值', '半期目标值']
+        semi_target_keywords = ['半年度目标值', '半年目标值', '中期目标值', '半期目标值', '半年度指标', '半年指标']
         semi_rule_keywords = ['半年度计分规则', '半年计分规则', '中期计分规则', '半期计分规则']
 
         # 识别半年度目标值列
@@ -365,6 +373,52 @@ class BSCProcessor:
         return None
 
     @staticmethod
+    def extract_target_pct_baseline(rule_text: str) -> Optional[Tuple[float, str]]:
+        """
+        提取目标值百分比型底线规则
+
+        匹配模式：
+        - "实际值<85%*目标值万元，不得分" -> (0.85, '正向')
+        - "实际值=80%*目标值万元，得60分" -> (0.80, '正向')
+        - "实际值<80%，不得分" -> (0.80, '正向')
+        - "<80%*目标值，不得分" -> (0.80, '正向')
+        - "实际值>120%*目标值，不得分" -> (1.20, '逆向')
+
+        Returns:
+            (比例系数, 方向) 或 None
+        """
+        if pd.isna(rule_text) or not isinstance(rule_text, str):
+            return None
+
+        rule_text = rule_text.strip()
+
+        # 模式1: 实际值<X%*目标值(单位)，不得分/得0分/得60分
+        # 也匹配 <X%*目标值 (无"实际值"前缀)
+        pct_target_patterns = [
+            r'(?:实际值?\s*)?[<<=≤]\s*([0-9]+\.?[0-9]*)%\s*\*?\s*目标值',
+            r'(?:实际值?\s*)?[<<=≤]\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:不得分|得0分|得60分)',
+        ]
+
+        for pattern in pct_target_patterns:
+            match = re.search(pattern, rule_text)
+            if match:
+                ratio = float(match.group(1)) / 100
+                return (ratio, '正向')
+
+        # 模式2: 实际值>X%*目标值，不得分 (逆向)
+        pct_target_neg_patterns = [
+            r'(?:实际值?\s*)?[>>>=≥]\s*([0-9]+\.?[0-9]*)%\s*\*?\s*目标值',
+        ]
+
+        for pattern in pct_target_neg_patterns:
+            match = re.search(pattern, rule_text)
+            if match:
+                ratio = float(match.group(1)) / 100
+                return (ratio, '逆向')
+
+        return None
+
+    @staticmethod
     def extract_ratio_baseline(rule_text: str) -> Optional[Tuple[float, str]]:
         """
         提取比例型计分规则的得分阈值
@@ -391,12 +445,13 @@ class BSCProcessor:
             r'除\s*以\s*目标',
             r'/\s*目标',
             r'÷\s*目标',
+            r'按.*?比例.*?得分',
         ]
 
         is_ratio_rule = any(re.search(kw, rule_text) for kw in ratio_keywords)
 
-        # 或者规则是"最多100分"这种形式（隐含比例计算）
-        is_max_score = re.search(r'最多\s*100分', rule_text) is not None
+        # 或者规则是"最多100分"或"100分封顶"这种形式（隐含比例计算）
+        is_max_score = re.search(r'(?:最多\s*100分|100分封顶)', rule_text) is not None
 
         if not is_ratio_rule and not is_max_score:
             return None
@@ -448,22 +503,22 @@ class BSCProcessor:
         # 格式如：每低1%扣2分、每低于1%扣2分、每低于目标值2%，减5分、每低3分减7分、每少0.1%扣5分
         # 注意：alternation要按长度降序排列（长的在前）避免部分匹配问题
         patterns_positive = [
-            # 格式1: 每低于目标值X%[,，]扣/减Y分
-            r'每低于目标值\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式2: 每低于X%[,，]扣/减Y分
-            r'每低于\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式3: 每低X%[,，]扣/减Y分
-            r'每低\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式4: 每少X%[,，]扣/减Y分（如：每少0.1%扣5分）
-            r'每少\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式5: 每低于目标值X分[,，]扣/减Y分
-            r'每低于目标值\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式6: 每低X分[,，]扣/减Y分
-            r'每低\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式7: 每少X个[,，]扣/减Y分
-            r'每少\s*([0-9]+\.?[0-9]*)\s*个\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            # 格式8: 每差/每降/每小 X单位[,，]扣/减Y分
-            r'每[差小降](?:于目标值)?\s*([0-9]+\.?[0-9]*)\s*(?:%|[个人次项元万千百])?\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式1: 每低于目标值X%[,，]扣/扣减/减Y分
+            r'每低于目标值\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式2: 每低于X%[,，]扣/扣减/减Y分
+            r'每低于\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式3: 每低X%[,，]扣/扣减/减Y分
+            r'每低\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式4: 每少X%[,，]扣/扣减/减Y分（如：每少0.1%扣5分）
+            r'每少\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式5: 每低于目标值X分[,，]扣/扣减/减Y分
+            r'每低于目标值\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式6: 每低X分[,，]扣/扣减/减Y分
+            r'每低\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式7: 每少X个[,，]扣/扣减/减Y分
+            r'每少\s*([0-9]+\.?[0-9]*)\s*个\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            # 格式8: 每差/每降/每小/每降低 X单位[,，]扣/扣减/减Y分
+            r'每[差小降低]于?(?:目标值)?\s*([0-9]+\.?[0-9]*)\s*(?:%|[个人次项元万千百])?\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
         ]
 
         for pattern in patterns_positive:
@@ -477,11 +532,12 @@ class BSCProcessor:
 
         # 逆向指标：每高/每超/每多/每高于目标值
         patterns_negative = [
-            r'每高于目标值\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            r'每高\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            r'每高于目标值\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            r'每高\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
-            r'每[高超多](?:于目标值)?\s*([0-9]+\.?[0-9]*)\s*(?:%|[个人次项元万千百])?\s*[,，]?\s*(?:扣|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            r'每高于目标值\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            r'每高于\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            r'每高\s*([0-9]+\.?[0-9]*)%\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            r'每高于目标值\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            r'每高\s*([0-9]+\.?[0-9]*)\s*分\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
+            r'每[高超多]于?(?:目标值)?\s*([0-9]+\.?[0-9]*)\s*(?:%|[个人次项元万千百])?\s*[,，]?\s*(?:扣减?|减)\s*([0-9]+\.?[0-9]*)\s*分',
         ]
 
         for pattern in patterns_negative:
@@ -544,6 +600,7 @@ class BSCProcessor:
 
         逻辑优先级：
         A. 比例型规则：实际值/目标值×100，得分阈值60分
+        A2. 目标值百分比型：实际值<X%*目标值，baseline=target*ratio
         B. 扣分推导：根据扣分规则计算
         C. 显式阈值：从规则中直接提取（排除得分阈值如"60分"）
         D. 默认兜底：目标值的80%或120%
@@ -558,6 +615,8 @@ class BSCProcessor:
         """
         baseline = None
         status = '成功'
+        # 统一全角→半角，确保后续正则能匹配
+        rule_text = self.normalize_fullwidth(rule_text)
         direction = self.detect_indicator_direction(rule_text) or '正向'
 
         # 逻辑A（最高优先级）: 比例型规则
@@ -566,6 +625,15 @@ class BSCProcessor:
         ratio_info = self.extract_ratio_baseline(rule_text)
         if ratio_info is not None:
             ratio, detected_direction = ratio_info
+            direction = detected_direction
+            baseline = target * ratio
+            return baseline, '成功', direction
+
+        # 逻辑A2: 目标值百分比型底线
+        # 如 "实际值<85%*目标值，不得分" -> baseline = target * 0.85
+        target_pct_info = self.extract_target_pct_baseline(rule_text)
+        if target_pct_info is not None:
+            ratio, detected_direction = target_pct_info
             direction = detected_direction
             baseline = target * ratio
             return baseline, '成功', direction
